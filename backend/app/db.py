@@ -78,12 +78,32 @@ CREATE TABLE IF NOT EXISTS instances (
   app_id INTEGER NOT NULL,
   env_id INTEGER NOT NULL,
   version TEXT NOT NULL,
-  health TEXT NOT NULL DEFAULT '探针绿' CHECK(health IN ('探针绿','探针红')),
+  health TEXT NOT NULL DEFAULT '探针绿' CHECK(health IN ('探针绿','探针红','探针待报')),
   release_id INTEGER,
   updated_at TEXT NOT NULL,
+  fail_count INTEGER NOT NULL DEFAULT 0,
+  backfilled INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY(app_id) REFERENCES apps(id),
   FOREIGN KEY(env_id) REFERENCES environments(id),
   FOREIGN KEY(release_id) REFERENCES releases(id)
+);
+CREATE TABLE IF NOT EXISTS switch_ledger (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  switch_key TEXT NOT NULL UNIQUE,
+  release_id INTEGER NOT NULL,
+  app_id INTEGER NOT NULL,
+  env_id INTEGER NOT NULL,
+  version TEXT NOT NULL,
+  roster_committed INTEGER NOT NULL DEFAULT 1,
+  attached_count INTEGER NOT NULL DEFAULT 1,
+  outcome TEXT NOT NULL DEFAULT '',
+  gap_mark TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  replayed_count INTEGER NOT NULL DEFAULT 0,
+  FOREIGN KEY(release_id) REFERENCES releases(id),
+  FOREIGN KEY(app_id) REFERENCES apps(id),
+  FOREIGN KEY(env_id) REFERENCES environments(id)
 );
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
@@ -101,15 +121,38 @@ CREATE TABLE IF NOT EXISTS audit_events (
 
 RELEASE_STATUSES = ("待入闸", "已入闸", "晋升中", "已放行", "回滚中", "已回滚", "已关闭")
 PIPELINE_STATUSES = ("未回执", "绿", "红")
-HEALTH_STATUSES = ("探针绿", "探针红")
+HEALTH_STATUSES = ("探针绿", "探针红", "探针待报")
 WINDOW_STATUSES = ("窗开", "窗关")
+
+# 进程级“锚连接”：WAL 模式下最后一个连接关闭会触发 checkpoint+fsync，
+# 在慢盘（overlay/WSL）上每次请求开关连接会产生数百毫秒卡顿。保留一个
+# 常驻连接后，请求连接关闭不再充当“最后一个连接”，提交延迟恢复正常。
+_anchor: sqlite3.Connection | None = None
+_anchor_path: str | None = None
+
+
+def retain_anchor() -> None:
+    global _anchor, _anchor_path
+    path = str(DB_PATH)
+    if _anchor is not None and _anchor_path == path:
+        return
+    if _anchor is not None:
+        try:
+            _anchor.close()
+        except sqlite3.Error:
+            pass
+    _anchor = connect()
+    _anchor_path = path
 
 
 def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
+    # WAL 下 NORMAL 足够安全且不会每次提交都 fsync，显著降低提交延迟。
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -126,9 +169,67 @@ def db():
         conn.close()
 
 
+def _columns(conn, table: str) -> set[str]:
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def migrate_db(conn: sqlite3.Connection) -> None:
+    """Idempotent additive migration for snapshots created before the
+    fail_count / backfilled / 探针待报 / switch_ledger era."""
+    cols = _columns(conn, "instances")
+    if "fail_count" not in cols:
+        conn.execute("ALTER TABLE instances ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0")
+    if "backfilled" not in cols:
+        conn.execute("ALTER TABLE instances ADD COLUMN backfilled INTEGER NOT NULL DEFAULT 0")
+    schema_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='instances'"
+    ).fetchone()
+    if schema_sql and "探针待报" not in (schema_sql[0] or ""):
+        conn.execute("ALTER TABLE instances RENAME TO instances_old")
+        conn.execute(
+            """
+            CREATE TABLE instances (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              app_id INTEGER NOT NULL,
+              env_id INTEGER NOT NULL,
+              version TEXT NOT NULL,
+              health TEXT NOT NULL DEFAULT '探针绿'
+                CHECK(health IN ('探针绿','探针红','探针待报')),
+              release_id INTEGER,
+              updated_at TEXT NOT NULL,
+              fail_count INTEGER NOT NULL DEFAULT 0,
+              backfilled INTEGER NOT NULL DEFAULT 0,
+              FOREIGN KEY(app_id) REFERENCES apps(id),
+              FOREIGN KEY(env_id) REFERENCES environments(id),
+              FOREIGN KEY(release_id) REFERENCES releases(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO instances
+              (id, app_id, env_id, version, health, release_id, updated_at, fail_count, backfilled)
+            SELECT id, app_id, env_id, version, health, release_id, updated_at,
+                   CASE WHEN health='探针红' AND COALESCE(fail_count, 0) < 1
+                        THEN 1 ELSE COALESCE(fail_count, 0) END,
+                   COALESCE(backfilled, 0)
+            FROM instances_old
+            """
+        )
+        conn.execute("DROP TABLE instances_old")
+    conn.commit()
+
+
 def init_db() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with db() as conn:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.DatabaseError:
+            pass
         conn.executescript(SCHEMA)
+        migrate_db(conn)
+    retain_anchor()
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict | None:

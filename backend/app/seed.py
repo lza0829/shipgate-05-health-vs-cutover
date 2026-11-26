@@ -3,11 +3,47 @@ from datetime import datetime, timedelta
 
 from app.db import db, init_db
 from app.services.common import audit, now_str, set_app_env_version, upsert_instance
+from app.services.outcomes import (
+    CANONICAL_THRESHOLD_KEY,
+    DEFAULT_THRESHOLD,
+    POLICY_CODE,
+    POLICY_LABEL,
+)
+
+
+def ensure_baseline_settings(conn) -> None:
+    """Idempotent defaults，老库重启也能补齐阈值与策略明示。"""
+    defaults = {
+        "允许跳级": "否",
+        "金丝雀默认比例": "10",
+        "入闸须流水线绿": "是",
+        "维护窗硬拒": "是",
+        CANONICAL_THRESHOLD_KEY: str(DEFAULT_THRESHOLD),
+        "放行探针策略": f"{POLICY_CODE} {POLICY_LABEL}",
+    }
+    for key, value in defaults.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
+            (key, value),
+        )
+    # 用户原词别名补齐，并与 canonical 阈值对齐（API 写任一阈值键也会写穿）。
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key=?", (CANONICAL_THRESHOLD_KEY,)
+    ).fetchone()
+    canonical_value = row["value"] if row is not None else str(DEFAULT_THRESHOLD)
+    conn.execute(
+        """
+        INSERT INTO settings(key, value) VALUES('探针失败次数阈值', ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (canonical_value,),
+    )
 
 
 def seed_if_empty() -> None:
     init_db()
     with db() as conn:
+        ensure_baseline_settings(conn)
         n = conn.execute("SELECT COUNT(*) AS c FROM apps").fetchone()["c"]
         if n:
             return
@@ -46,7 +82,7 @@ def seed_if_empty() -> None:
 
         conn.execute(
             """
-            INSERT INTO settings(key, value) VALUES
+            INSERT OR IGNORE INTO settings(key, value) VALUES
               ('允许跳级', '否'),
               ('金丝雀默认比例', '10'),
               ('入闸须流水线绿', '是'),

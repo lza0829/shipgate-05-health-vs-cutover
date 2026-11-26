@@ -3,6 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from app.db import db, rows_to_list
 from app.services.common import audit, now_str, set_app_env_version
+from app.services.outcomes import roster_views
 
 router = APIRouter(tags=["应用"])
 
@@ -21,6 +22,13 @@ def list_apps():
                 "SELECT id AS 编号, name AS 名称, owner AS 负责人, status AS 状态 FROM apps ORDER BY id"
             ).fetchall()
         )
+
+
+@router.get("/名册")
+def list_roster():
+    """名册（各应用各环境当前版本 app_env_versions）+ 统一结局/缺口标。"""
+    with db() as conn:
+        return roster_views(conn)
 
 
 @router.post("/应用")

@@ -11,6 +11,7 @@ from app.services.common import (
     next_serial,
     now_str,
 )
+from app.services.outcomes import enrich_release, fail_threshold
 
 router = APIRouter(tags=["发版单"])
 
@@ -30,13 +31,15 @@ class PipelineIn(BaseModel):
 @router.get("/发版单")
 def list_releases():
     with db() as conn:
-        return rows_to_list(conn.execute(RELEASE_SELECT + " ORDER BY r.id DESC").fetchall())
+        threshold = fail_threshold(conn)
+        rows = rows_to_list(conn.execute(RELEASE_SELECT + " ORDER BY r.id DESC").fetchall())
+        return [enrich_release(conn, r, threshold) for r in rows]
 
 
 @router.get("/发版单/{release_id}")
 def one_release(release_id: int):
     with db() as conn:
-        return row_to_dict(get_release(conn, release_id))
+        return enrich_release(conn, row_to_dict(get_release(conn, release_id)))
 
 
 @router.post("/发版单")
